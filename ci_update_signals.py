@@ -1,100 +1,78 @@
 #!/usr/bin/env python3
 """
 CI daily update ? twse-backtests
-- Fetches today's TWSE prices
+- Fetches the latest session TWSE has published, labelled with TWSE's own date
 - Updates docs/data/charts/*.json (180-day OHLCV window)
 - Updates docs/data/signals.json scan_date and entry prices
 """
-import json, ssl, sys, math
-from datetime import date, datetime
+import json, sys, math
+from datetime import datetime
 from pathlib import Path
-import urllib.request
+
+from slashman_finance import fetch_text, roc_to_ad, stock_day_all
+from slashman_finance.twse import RWD, parse_stock_day_rwd
 
 CHARTS_DIR  = Path("docs/data/charts")
 SIGNALS_FILE = Path("docs/data/signals.json")
-TODAY = date.today().isoformat()
-
-CTX = ssl.create_default_context()
-CTX.check_hostname = False
-CTX.verify_mode    = ssl.CERT_NONE
-
-def fetch_json(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, context=CTX, timeout=30) as r:
-        return json.loads(r.read())
 
 def fetch_prices():
-    try:
-        rows = fetch_json("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL")
-        if not rows: raise ValueError("empty")
-        p = {}
-        for row in rows:
-            try:
-                p[row["Code"]] = {
-                    "close": float(row["ClosingPrice"].replace(",","")),
-                    "open":  float(row["OpeningPrice"].replace(",","")),
-                    "high":  float(row["HighestPrice"].replace(",","")),
-                    "low":   float(row["LowestPrice"].replace(",","")),
-                    "volume":float(row["TradeVolume"].replace(",","")),
-                }
-            except: pass
-        return p
-    except Exception as e:
-        print(f"  OpenAPI failed: {e}, trying RWD...")
-    try:
-        d = date.today().strftime("%Y%m%d")
-        rwd = fetch_json(f"https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json&date={d}")
-        return {
-            str(r[0]).strip(): {
-                "close": float(str(r[7]).replace(",","")),
-                "open":  float(str(r[4]).replace(",","")),
-                "high":  float(str(r[5]).replace(",","")),
-                "low":   float(str(r[6]).replace(",","")),
-                "volume":float(str(r[2]).replace(",","")),
-            }
-            for r in rwd.get("data", []) if len(r) >= 8
-        }
-    except Exception as e2:
-        print(f"  RWD also failed: {e2}"); return {}
+    """(session ISO date, {code: {close, open, high, low, volume}}) for the latest published session.
 
-def update_chart(path, ticker, p):
+    Bars must carry this date, never the clock: the data can be older than today. The RWD file
+    rolls soon after the close; the OpenAPI file only rolls at about 05:20 Taipei the next
+    morning, so a run on the cron would read the previous session from it.
+    """
+    try:
+        roc, prices, _ = parse_stock_day_rwd(fetch_text(f"{RWD}/afterTrading/STOCK_DAY_ALL?response=json"))
+    except Exception as e:
+        print(f"  RWD STOCK_DAY_ALL failed: {e}, trying OpenAPI...")
+        roc, prices = "", {}
+    if not prices:
+        roc, prices = stock_day_all(fallback=False)
+    return roc_to_ad(roc).isoformat(), prices
+
+def high20_series(ohlcv):
+    """Rolling 20-bar high of the bar highs, from the 20th bar on."""
+    highs = [r["high"] for r in ohlcv]
+    return [{"time": ohlcv[i]["time"], "value": max(highs[i-19:i+1])}
+            for i in range(19, len(highs))]
+
+def update_chart(path, ticker, p, session):
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except:
-        data = {"ticker": ticker, "scan_date": TODAY, "ohlcv": [], "high20": [], "macd": [], "adx": [], "wr": [], "signal_marks": []}
+        data = {"ticker": ticker, "scan_date": session, "ohlcv": [], "high20": [], "macd": [], "adx": [], "wr": [], "signal_marks": []}
 
     ohlcv = data.get("ohlcv", [])
-    if ohlcv and ohlcv[-1].get("time") == TODAY:
-        return  # already updated today
+    if ohlcv and ohlcv[-1].get("time") > session:
+        return  # older data than the chart already has
+    if ohlcv and ohlcv[-1].get("time") == session:
+        ohlcv.pop()  # re-read: volumes are provisional until about 14:35 Taipei
 
-    ohlcv.append({"time": TODAY, "open": p["open"], "high": p["high"],
+    ohlcv.append({"time": session, "open": p["open"], "high": p["high"],
                   "low": p["low"], "close": p["close"], "volume": int(p["volume"])})
     # Keep last 180 rows
     data["ohlcv"] = ohlcv[-180:]
-    data["scan_date"] = TODAY
-
-    # Recompute high20 from ohlcv
-    highs = [r["high"] for r in data["ohlcv"]]
-    h20 = []
-    for i in range(len(highs)):
-        if i >= 19:
-            h20.append({"time": data["ohlcv"][i]["time"], "value": max(highs[i-19:i+1])})
-    data["high20"] = h20
+    data["scan_date"] = session
+    data["high20"] = high20_series(data["ohlcv"])
 
     path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 def main():
-    print(f"[{datetime.now():%Y-%m-%d %H:%M}] Fetching prices for {TODAY}...")
-    prices = fetch_prices()
+    print(f"[{datetime.now():%Y-%m-%d %H:%M}] Fetching latest TWSE session...")
+    try:
+        session, prices = fetch_prices()
+    except Exception as e:
+        print(f"No price data: {e}"); sys.exit(0)
     if not prices:
         print("No price data ? non-trading day?"); sys.exit(0)
-    print(f"  Got {len(prices)} stocks")
+    print(f"  Got {len(prices)} stocks for session {session}")
 
     # Update chart files for signal stocks
     for chart_path in sorted(CHARTS_DIR.glob("*.json")):
         ticker = chart_path.stem
         if ticker in prices:
-            update_chart(chart_path, ticker, prices[ticker])
+            update_chart(chart_path, ticker, prices[ticker], session)
             print(f"  Chart updated: {ticker} -> {prices[ticker]['close']}")
 
     # Update signals.json
@@ -106,9 +84,9 @@ def main():
         if ticker in prices:
             sig["price"] = prices[ticker]["close"]
             updated += 1
-    signals_data["scan_date"] = TODAY
+    signals_data["scan_date"] = session
     SIGNALS_FILE.write_text(json.dumps(signals_data, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"  signals.json: scan_date={TODAY}, updated {updated}/{len(entry_sigs)} prices")
+    print(f"  signals.json: scan_date={session}, updated {updated}/{len(entry_sigs)} prices")
 
 if __name__ == "__main__":
     main()
